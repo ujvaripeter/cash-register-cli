@@ -24,7 +24,12 @@ from copy import deepcopy
 from datetime import date
 
 # Napi mentés/betöltés
-from storage import load_state as storage_load_state, save_state as storage_save_state, reset_state as storage_reset_state
+from storage import (
+    load_state as storage_load_state,
+    save_state as storage_save_state,
+    reset_state as storage_reset_state,
+    DATA_DIR as STORAGE_DATA_DIR,
+)
 
 # Megtartjuk a nagyobb címleteket önállóan:
 NOTE_DENOMS = [20000, 10000, 5000, 2000, 1000, 500, 200]  # darabszám szerint
@@ -46,9 +51,8 @@ def _today_str() -> str:
 def _txlog_path(day: Optional[str] = None) -> Path:
     if day is None:
         day = _today_str()
-    p = Path("data")
-    p.mkdir(parents=True, exist_ok=True)
-    return p / f"{day}_txlog.jsonl"
+    STORAGE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return STORAGE_DATA_DIR / f"{day}_txlog.jsonl"
 
 
 def append_txlog(entry: Dict, day: Optional[str] = None) -> None:
@@ -376,9 +380,9 @@ def main():
                     if day is None:
                         storage_save_state(drawer_to_state(target_drawer))
                     else:
-                        # mentés konkrét napra
+                        # mentés konkrét napra ugyanabba a projekt mappába
                         state = drawer_to_state(target_drawer)
-                        out_path = Path("data") / f"{day}_drawer.json"
+                        out_path = STORAGE_DATA_DIR / f"{day}_drawer.json"
                         out_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
                     truncate_last_tx(day)
                     print(f"Utolsó tranzakció visszavonva. Új összesen: {target_drawer.total():,} Ft".replace(",", " "))
@@ -588,5 +592,290 @@ def main():
         finalize_tx_and_clear_snapshot()
 
 
-if __name__ == "__main__":
+def _running_in_streamlit() -> bool:
+    """Best-effort detection whether the script is driven by Streamlit.
+
+    Works even if __name__ != "__main__" under Streamlit.
+    """
+    try:
+        # Newer Streamlit: runtime context API
+        from streamlit.runtime.scriptrunner.script_run_context import (
+            get_script_run_ctx,
+        )
+        if get_script_run_ctx() is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        import streamlit as st  # noqa: F401
+        # Some builds expose st.runtime.exists()
+        rt = getattr(st, "runtime", None)
+        if rt is not None and callable(getattr(rt, "exists", None)):
+            if rt.exists():
+                return True
+    except Exception:
+        pass
+    import os, sys
+    # Env/module fallbacks used by Streamlit
+    if any(k in os.environ for k in ("STREAMLIT_SERVER_PORT", "STREAMLIT_RUNTIME")):
+        return True
+    if any(m.startswith("streamlit.") or m == "streamlit" for m in sys.modules.keys()):
+        # If Streamlit imported us and modules are loaded, likely running via Streamlit
+        return True
+    return False
+
+
+def streamlit_app() -> None:
+    import streamlit as st
+    import pandas as pd
+
+    st.set_page_config(page_title="Kassza & Visszajáró – Streamlit UI", page_icon="💴", layout="centered")
+
+    st.title("Kassza & Visszajáró – Streamlit UI")
+
+    # Load today's state
+    state = storage_load_state()
+    if state is None:
+        drawer = Drawer()
+    else:
+        drawer = state_to_drawer(state)
+
+    # Sidebar: actions
+    with st.sidebar:
+        st.header("Műveletek")
+        # Kezdőkészlet felvitele (oldalsáv gomb + űrlap)
+        if "_show_init_form" not in st.session_state:
+            st.session_state._show_init_form = False
+
+        if st.button("Kezdőkészlet felvitele"):
+            st.session_state._show_init_form = not st.session_state._show_init_form
+
+        if st.session_state._show_init_form:
+            with st.form("init_form"):
+                st.caption("Állítsd be a kezdőkészlet darabszámát és az aprót.")
+                init_counts = {}
+                for d in sorted(NOTE_DENOMS, reverse=True):
+                    init_counts[d] = st.number_input(
+                        f"{d} Ft darabszám", min_value=0, step=1, value=int(drawer.notes.get(d, 0))
+                    )
+                init_apro = st.number_input(
+                    f"Apró összeg (Ft, {COIN_MIN_UNIT}-tel osztható)",
+                    min_value=0,
+                    step=COIN_MIN_UNIT,
+                    value=int(drawer.apro),
+                )
+                ok = st.form_submit_button("Ment kezdőkészlet")
+            if ok:
+                # Apply and save
+                for d, v in init_counts.items():
+                    drawer.notes[d] = int(v)
+                if init_apro % COIN_MIN_UNIT != 0:
+                    st.error(f"Apró összege {COIN_MIN_UNIT}-tel osztható legyen.")
+                else:
+                    drawer.apro = int(init_apro)
+                    storage_save_state(drawer_to_state(drawer))
+                    st.success("Kezdőkészlet mentve a mai naphoz.")
+                    st.session_state._show_init_form = False
+
+        if st.button("Ment (mai állapot)"):
+            storage_save_state(drawer_to_state(drawer))
+            st.success("Állapot mentve a mai naphoz.")
+
+        if st.button("Nulláz"):
+            st.session_state.pop("_last_change", None)
+            new_state = storage_reset_state()
+            drawer.notes = {int(k): int(v) for k, v in new_state["bankjegyek"].items()}
+            drawer.apro = int(new_state["apro"])
+            st.success("Kassza nullázva és elmentve mára.")
+
+        if st.button("Visszavon (utolsó tranz.)"):
+            last = read_last_tx()
+            if not last:
+                st.warning("Nincs visszavonható tranzakció.")
+            else:
+                # apply inverse delta
+                delta = last.get("delta", {})
+                delta_notes = {int(k): int(v) for k, v in delta.get("notes", {}).items()}
+                delta_apro = int(delta.get("apro", 0))
+
+                # compute new values safely
+                new_notes = dict(drawer.notes)
+                ok = True
+                for d in NOTE_DENOMS:
+                    new_cnt = new_notes.get(d, 0) - delta_notes.get(d, 0)
+                    if new_cnt < 0:
+                        ok = False
+                        break
+                    new_notes[d] = new_cnt
+                new_apro = drawer.apro - delta_apro
+                if new_apro < 0:
+                    ok = False
+
+                if not ok:
+                    st.error("Inkonzisztens napló, nem vonható vissza.")
+                else:
+                    drawer.notes = new_notes
+                    drawer.apro = new_apro
+                    storage_save_state(drawer_to_state(drawer))
+                    truncate_last_tx()
+                    st.success("Utolsó tranzakció visszavonva.")
+
+    # Current state overview
+    st.subheader("Jelenlegi kassza")
+    # Táblázat: bankjegyek darabszáma + sor az aprónak és az összesennek
+    rows = []
+    for d in sorted(NOTE_DENOMS, reverse=True):
+        cnt = int(drawer.notes.get(d, 0))
+        rows.append({"Címlet (Ft)": f"{d}", "Darab": cnt, "Érték (Ft)": d * cnt})
+    # Apró és összesen
+    bank_total = sum(r["Érték (Ft)"] for r in rows)
+    rows.append({"Címlet (Ft)": "Apró (összeg)", "Darab": "—", "Érték (Ft)": int(drawer.apro)})
+    rows.append({"Címlet (Ft)": "Összesen", "Darab": "—", "Érték (Ft)": bank_total + int(drawer.apro)})
+    df = pd.DataFrame(rows)
+    st.table(df)
+
+    st.markdown("---")
+    st.subheader("Új tranzakció")
+
+    with st.form("tx_form", clear_on_submit=False):
+        amount = st.number_input(
+            "Vásárlás összege (Ft)", min_value=0, step=COIN_MIN_UNIT, value=0
+        )
+        st.caption(
+            f"Az összeg legyen {COIN_MIN_UNIT}-tel osztható."
+        )
+
+        tender_str = st.text_input(
+            "Vevő által adott (pl. '2000x1, 1000x1, apro:150')",
+            value="",
+        )
+        submitted = st.form_submit_button("Tranzakció rögzítése")
+
+    if submitted:
+        # Validate amount
+        if amount <= 0 or amount % COIN_MIN_UNIT != 0:
+            st.error(f"Érvénytelen összeg. Nem negatív és {COIN_MIN_UNIT}-tel osztható legyen.")
+            return
+        # Parse tender
+        try:
+            tender_notes, tender_apro = parse_tender(tender_str)
+        except ParseError as e:
+            st.error(f"Hiba a tender megadásában: {e}")
+            return
+
+        tender_total = sum(d * c for d, c in tender_notes.items()) + tender_apro
+        if tender_total < amount:
+            st.error(
+                f"A vevő által adott összeg ({tender_total} Ft) kevesebb, mint a fizetendő ({amount} Ft)."
+            )
+            return
+
+        # Work on a copy to compute change
+        work_drawer = Drawer(notes=dict(drawer.notes), apro=drawer.apro)
+        work_drawer.add_notes(tender_notes)
+        work_drawer.add_apro(tender_apro)
+
+        change = tender_total - amount
+        notes_given: Dict[int, int] = {}
+        apro_given = 0
+
+        if change == 0:
+            # No change, just persist
+            pass
+        else:
+            cand = bounded_change_notes(change, work_drawer.notes)
+            if cand is not None:
+                notes_given = cand
+            else:
+                remaining = change
+                notes_used = {d: 0 for d in NOTE_DENOMS}
+                for d in sorted(NOTE_DENOMS, reverse=True):
+                    use = min(remaining // d, work_drawer.notes.get(d, 0))
+                    if use > 0:
+                        notes_used[d] = use
+                        remaining -= d * use
+                if remaining % COIN_MIN_UNIT == 0 and work_drawer.apro >= remaining:
+                    notes_given = {d: c for d, c in notes_used.items() if c > 0}
+                    apro_given = remaining
+                else:
+                    success = False
+                    for d in sorted(NOTE_DENOMS, reverse=True):
+                        while notes_used[d] > 0:
+                            notes_used[d] -= 1
+                            remaining += d
+                            if remaining % COIN_MIN_UNIT == 0 and work_drawer.apro >= remaining:
+                                notes_given = {dd: cc for dd, cc in notes_used.items() if cc > 0}
+                                apro_given = remaining
+                                success = True
+                                break
+                        if success:
+                            break
+                    if not success:
+                        st.error("Nem tudok pontos összeget visszaadni a jelenlegi készletből.")
+                        return
+
+            # Apply change removal to work_drawer
+            if notes_given:
+                try:
+                    work_drawer.remove_notes(notes_given)
+                except Exception as e:
+                    st.error(f"Belső hiba (jegyek kivét): {e}")
+                    return
+            if apro_given:
+                try:
+                    work_drawer.remove_apro(apro_given)
+                except Exception as e:
+                    st.error(f"Belső hiba (apró kivét): {e}")
+                    return
+
+        # Persist: compute delta and log
+        from datetime import datetime as _dt
+        ts = _dt.now().isoformat(timespec="seconds")
+
+        delta_notes = {}
+        for d in set(list(tender_notes.keys()) + list(notes_given.keys())):
+            delta_val = tender_notes.get(d, 0) - notes_given.get(d, 0)
+            if delta_val != 0:
+                delta_notes[str(d)] = int(delta_val)
+
+        entry = {
+            "ts": ts,
+            "amount_due": int(amount),
+            "buyer_given": {
+                "notes": {str(d): int(c) for d, c in tender_notes.items()},
+                "apro": int(tender_apro),
+            },
+            "change": {
+                "notes": {str(d): int(c) for d, c in notes_given.items()},
+                "apro": int(apro_given),
+            },
+            "delta": {
+                "notes": delta_notes,
+                "apro": int(tender_apro - apro_given),
+            },
+            "total_after": work_drawer.total(),
+        }
+
+        # Update real drawer from work_drawer
+        drawer.notes = dict(work_drawer.notes)
+        drawer.apro = int(work_drawer.apro)
+
+        append_txlog(entry)
+        storage_save_state(drawer_to_state(drawer))
+
+        # Show result
+        st.success(
+            f"Fizetendő: {amount} Ft | Adott: {tender_total} Ft | Visszajáró: {change} Ft"
+        )
+        st.write("Visszajáró – bankjegyek:", format_notes(notes_given))
+        st.write(f"Visszajáró – apró: {apro_given} Ft")
+
+        # Refresh metrics
+        st.rerun()
+
+
+# Always prefer Streamlit app when detected, regardless of __name__
+if _running_in_streamlit():
+    streamlit_app()
+elif __name__ == "__main__":
     main()

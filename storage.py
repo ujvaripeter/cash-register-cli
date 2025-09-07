@@ -22,7 +22,7 @@ from typing import Dict, Optional
 # Címletek sorrendje a feladat szerint
 NOTE_DENOMS = [20000, 10000, 5000, 2000, 1000, 500, 200]
 
-DATA_DIR = Path("data")
+DATA_DIR = Path(__file__).parent / "data"
 
 
 def _today_str() -> str:
@@ -77,4 +77,3 @@ def reset_state() -> Dict:
     }
     save_state(empty)
     return empty
-
